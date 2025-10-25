@@ -719,68 +719,14 @@ class VideoClip(Clip):
 
     def compose_on(
         self, background: np.ndarray, t, background_mask: Union[np.ndarray, None] = None
-    ) -> Tuple[np.ndarray, Union[np.ndarray, None]]:
-        """Returns the result of the clip's frame at time `t` on top
-        on the given `picture`, the position of the clip being given
-        by the clip's ``pos`` attribute. Meant for compositing.
-
-        If the clip/backgrounds have transparency the transparency will
-        be accounted for.
-
-        The return is either a numpy array for image with no transparency or
-        a tuple (image, mask) for image with transparency
-
-        Parameters
-        ----------
-        background: (np.ndarray)
-          The background image to apply current clip on top of
-          if the background image is transparent it must be given as a RGBA image
-
-        t: (float)
-          The time of clip to apply on top of clip
-
-        background_mask: (np.ndarray|None), default None
-          The background mask to apply current clip on top of
-          if the background image is transparent it must be given as a mask
-          if None, the background is assumed to be fully opaque
-
-
-        Return
-        -------
-        (np.ndarray, np.ndarray|None)
-          A tuple with the new image and a mask if applicable, or None
-
-
-        """
+    ) -> np.ndarray:
+        """Overlay the clip frame at time `t` onto `background`."""
         ct = t - self.start  # clip time
 
-        # GET IMAGE AND MASK IF ANY
         clip_frame = self.get_frame(ct).astype("uint8")
         background_height, background_width = background.shape[:2]
         clip_height, clip_width = clip_frame.shape[:2]
-        clip_mask = None
 
-        if self.mask is not None:
-            # Clip mask normalize to 0 (fully transparent) to 1 (fully opaque)
-            clip_mask = self.mask.get_frame(ct)
-
-            # Resize clip_mask_img to match clip_img, always use top left corner
-            if clip_frame.shape[:2] != clip_mask.shape[:2]:
-                mask_height, mask_width = clip_mask.shape[:2]
-
-                # If mask is larger, crop it
-                if mask_width > clip_width or mask_height > clip_height:
-                    clip_mask = clip_mask[:clip_height, :clip_width]
-
-                # If mask is smaller, fill it with zeros
-                if mask_width < clip_width or mask_height < clip_height:
-                    new_mask = np.zeros(
-                        (clip_height, clip_width), dtype=clip_mask.dtype
-                    )
-                    new_mask[:mask_height, :mask_width] = clip_mask
-                    clip_mask = new_mask
-
-        # SET POSITION
         pos = self.pos(ct)
         x_start, y_start = compute_position(
             (clip_width, clip_height),
@@ -789,191 +735,53 @@ class VideoClip(Clip):
             self.relative_pos,
         )
 
-        # Clip destination coordinates in bg
         y1_bg = max(y_start, 0)
         y2_bg = min(y_start + clip_height, background_height)
         x1_bg = max(x_start, 0)
         x2_bg = min(x_start + clip_width, background_width)
 
-        # Corresponding source region in clip
         y1_clip = max(-y_start, 0)
         y2_clip = y1_clip + (y2_bg - y1_bg)
         x1_clip = max(-x_start, 0)
         x2_clip = x1_clip + (x2_bg - x1_bg)
 
-        # We will ignore any mask with no transparency so we only ever compute mask
-        # if really necessary
-        if background_mask is not None and np.min(background_mask) == 1:
-            background_mask = None
-
-        if clip_mask is not None and np.min(clip_mask) == 1:
-            clip_mask = None
-
-        # Copy the background to avoid modifying the original
         bg_copy = background.copy()
+        bg_copy[y1_bg:y2_bg, x1_bg:x2_bg] = clip_frame[y1_clip:y2_clip, x1_clip:x2_clip]
 
-        if background_mask is not None:
-            bg_mask_copy = background_mask.copy()
-
-        # If neither background nor clip have a mask, we can just paste clip on top
-        if background_mask is None and clip_mask is None:
-            bg_copy[y1_bg:y2_bg, x1_bg:x2_bg] = clip_frame[
-                y1_clip:y2_clip, x1_clip:x2_clip
-            ]
-            return (bg_copy, None)
-
-        # If clip has no alpha layer, we can compute final clip
-        # by replacing the background region with the clip region
-        # and fill the region mask with 1
-        if clip_mask is None:
-            bg_copy[y1_bg:y2_bg, x1_bg:x2_bg] = clip_frame[
-                y1_clip:y2_clip, x1_clip:x2_clip
-            ]
-            bg_mask_copy[y1_bg:y2_bg, x1_bg:x2_bg] = np.ones(
-                (y2_bg - y1_bg, x2_bg - x1_bg), dtype=np.float32
-            )
-            return (bg_copy, bg_mask_copy)
-
-        # If background has no alpha layer, we can compute final color
-        # accounting for transparency and return a result with no transparency
-        if background_mask is None:
-            # Extract regions, convert to float32 instead of letting numpy go for float64
-            frame = clip_frame[y1_clip:y2_clip, x1_clip:x2_clip].astype(np.float32)
-            bg = bg_copy[y1_bg:y2_bg, x1_bg:x2_bg].astype(np.float32)
-            alpha = clip_mask[y1_clip:y2_clip, x1_clip:x2_clip][..., None].astype(
-                np.float32
-            )
-
-            # To understand the math, think in "passing light" (see self.compose_mask)
-            # if first layer is 100% opacity with 100 red photons, 0 green, 0 blue [100, 0, 0]
-            # and second layer is 70% opacity, with 0 red photons, 0 green, 100 blue [0, 0, 100]
-            # then we got 100 red, but 70% are blocked, so we get 100 - 100*0.7 = 30 red
-            # and we also get 100 blue, of which only 70% are "emited", so we get 100*0.7 = 70 blue
-            # we get a final [30, 0, 70] fully opaque sheet
-            result = frame * alpha + bg * (1 - alpha)
-
-            # Finally we update the regions with result back to int
-            bg_copy[y1_bg:y2_bg, x1_bg:x2_bg] = result.astype(np.uint8)
-            return (bg_copy, None)
-
-        # For images with alpha layer on both clip and background
-        # we must compute both new color and new mask
-        # Again to understand the math, consider the following to calculate the final mask
-        # Note :
-        # Thinking in transparency is hard, as we tend to think
-        # that 50% opaque + 40% opaque = 90% opacity, when it really its 70%
-        # It's a lot easier to think in terms of "passing light"
-        # Consider I emit 100 photons, and my first layer is 50% opaque, meaning it
-        # will "stop" 50% of the photons, I'll have 50 photons left
-        # now my second layer is blocking 40% of thoses 50 photons left
-        # blocking 50 * 0.4 = 20 photons, and leaving me with only 30 photons
-        # So, by adding two layer of 50% and 40% opacity my finaly opacity is only
-        # of (100-30)*100 = 70% opacity !
-        # the formula for final alpha is for B over A is : opacity B + opacity A * (1 - opacity B)
-
-        # We can understand the formula by thinking that a color with X% opacity will only emit color * X photons :
-        # B will emit 100 photons multiply by B opacity, so if opacity is 25%, 25 photons will pass
-        # It will also let pass the photons emitted by A, (100 * A opacity), for A = 50, 50 photons
-        # but of thoses 50, 25% will be blocked, so 50 - (50 * 0.25) = 50 * 0.75 = 37.5
-        # so at the end we get 25 + 37.5 = 62.5 photons, so the same as a one layer opacity of 62.5%
-        # so, how many photon B will let through + (how many photon A will let through * how many of thouse B will let through)
-        # again we get aB + aA * (1 - aB)
-        # at the end we must divide color by resulting alpha to keep true colors
-
-        # Extract regions, convert to float32 instead of letting numpy go for float64
-        frame = clip_frame[y1_clip:y2_clip, x1_clip:x2_clip].astype(np.float32)
-        bg = bg_copy[y1_bg:y2_bg, x1_bg:x2_bg].astype(np.float32)
-        alpha_clip = clip_mask[y1_clip:y2_clip, x1_clip:x2_clip].astype(np.float32)
-        alpha_bg = background_mask[y1_bg:y2_bg, x1_bg:x2_bg].astype(np.float32)
-
-        # Ensure alpha channels have the right shape for broadcasting
-        if alpha_clip.ndim == 2:
-            alpha_clip = alpha_clip[..., None]
-        if alpha_bg.ndim == 2:
-            alpha_bg = alpha_bg[..., None]
-
-        final_alpha = alpha_clip + alpha_bg * (1 - alpha_clip)
-        safe_alpha = np.where(final_alpha == 0, 1.0, final_alpha)
-        result = (frame * alpha_clip + bg * alpha_bg * (1 - alpha_clip)) / safe_alpha
-
-        bg_copy[y1_bg:y2_bg, x1_bg:x2_bg] = np.round(result).astype(np.uint8)
-
-        bg_mask_copy[y1_bg:y2_bg, x1_bg:x2_bg] = final_alpha.squeeze()
-        return (bg_copy, bg_mask_copy)
+        return bg_copy
 
     def compose_mask(self, background_mask: np.ndarray, t: float) -> np.ndarray:
-        """Returns the result of the clip's mask at time `t` composited
-        on the given `background_mask`, the position of the clip being given
-        by the clip's ``pos`` attribute. Meant for compositing.
-
-        (warning: only use this function to blit two masks together, never images)
-
-        Parameters
-        ----------
-        background_mask:
-          The underlying mask onto which the clip mask will be composed.
-
-        t:
-          The time position in the clip at which to extract the mask.
-        """
+        """Overlay the clip mask at time `t` onto `background_mask`."""
         ct = t - self.start  # clip time
         clip_mask = self.get_frame(ct).astype("float")
 
-        # numpy shape is H*W not W*H
         bg_h, bg_w = background_mask.shape
         clip_h, clip_w = clip_mask.shape
 
-        # SET POSITION
         pos = self.pos(ct)
         x_start, y_start = compute_position(
             (clip_w, clip_h), (bg_w, bg_h), pos, self.relative_pos
         )
 
-        # Clip destination coordinates in bg
         y1_bg = max(y_start, 0)
         y2_bg = min(y_start + clip_h, bg_h)
         x1_bg = max(x_start, 0)
         x2_bg = min(x_start + clip_w, bg_w)
 
-        # Corresponding source region in clip
         y1_clip = max(-y_start, 0)
         y2_clip = y1_clip + (y2_bg - y1_bg)
         x1_clip = max(-x_start, 0)
         x2_clip = x1_clip + (x2_bg - x1_bg)
 
-        # Blend the overlapping regions
-        # The calculus is clip_opacity + bg_opacity * (1 - base_opacity)
-        # this ensure that masks are drawn in the right order and
-        # the contribution of each mask is proportional to their transparency
-        #
-        # Note :
-        # Thinking in transparency is hard, as we tend to think
-        # that 50% opaque + 40% opaque = 90% opacity, when it really its 70%
-        # It's a lot easier to think in terms of "passing light"
-        # Consider I emit 100 photons, and my first layer is 50% opaque, meaning it
-        # will "stop" 50% of the photons, I'll have 50 photons left
-        # now my second layer is blocking 40% of thoses 50 photons left
-        # blocking 50 * 0.4 = 20 photons, and leaving me with only 30 photons
-        # So, by adding two layer of 50% and 40% opacity my finaly opacity is only
-        # of (100-30)*100 = 70% opacity !
-
-        # Copy the background mask to avoid modifying the original
-        b = background_mask.copy()
-
-        b[y1_bg:y2_bg, x1_bg:x2_bg] = clip_mask[
-            y1_clip:y2_clip, x1_clip:x2_clip
-        ] + background_mask[y1_bg:y2_bg, x1_bg:x2_bg] * (
-            1 - clip_mask[y1_clip:y2_clip, x1_clip:x2_clip]
-        )
-
-        return b
+        result = background_mask.copy()
+        result[y1_bg:y2_bg, x1_bg:x2_bg] = clip_mask[y1_clip:y2_clip, x1_clip:x2_clip]
+        return result
 
     def with_background_color(self, size=None, color=(0, 0, 0), pos=None, opacity=None):
         """Place the clip on a colored background.
 
         Returns a clip made of the current clip overlaid on a color
-        clip of a possibly bigger size. Can serve to flatten transparent
-        clips.
+        clip of a possibly bigger size.
 
         Parameters
         ----------
