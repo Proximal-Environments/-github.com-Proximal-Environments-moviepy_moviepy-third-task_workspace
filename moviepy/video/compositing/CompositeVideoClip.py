@@ -32,14 +32,16 @@ class CompositeVideoClip(VideoClip):
 
       - The attribute ``pos`` determines where the clip is placed.
           See ``VideoClip.set_pos``
-      - Clip masks are ignored during compositing; overlaid clips are pasted opaquely.
+      - The mask of the clip determines which parts are visible.
 
       Finally, if all the clips in the list have their ``duration``
       attribute set, then the duration of the composite video clip
       is computed automatically
 
     bg_color
-      Color for the unfilled regions. ``None`` falls back to black ``(0, 0, 0)``.
+      Color for the unmasked and unfilled regions. Set to None for these
+      regions to be transparent (will be slower).
+      Default is black (0, 0, 0).
 
     use_bgclip
       Set to True if the first clip in the list should be used as the
@@ -74,8 +76,19 @@ class CompositeVideoClip(VideoClip):
         if size is None:
             size = clips[0].size
 
-        if bg_color is None:
-            bg_color = 0.0 if is_mask else (0, 0, 0)
+        if use_bgclip and (clips[0].mask is None):
+            transparent = False
+        else:
+            transparent = True if bg_color is None else False
+
+        # If we must not use first clip as background and we dont have a color
+        # we generate a black background if clip should not be transparent and
+        # a transparent background if transparent
+        if (not use_bgclip) and bg_color is None:
+            if transparent:
+                bg_color = 0.0 if is_mask else (0, 0, 0, 0)
+            else:
+                bg_color = 0.0 if is_mask else (0, 0, 0)
 
         fpss = [clip.fps for clip in clips if getattr(clip, "fps", None)]
         self.fps = max(fpss) if fpss else None
@@ -114,21 +127,84 @@ class CompositeVideoClip(VideoClip):
         if audioclips:
             self.audio = CompositeAudioClip(audioclips)
 
+        # compute mask if necessary
+        if transparent:
+            maskclips = [
+                (clip.mask if (clip.mask is not None) else clip.with_mask().mask)
+                .with_position(clip.pos)
+                .with_end(clip.end)
+                .with_start(clip.start, change_end=False)
+                .with_layer_index(clip.layer_index)
+                for clip in self.clips
+            ]
+
+            if use_bgclip and self.bg.mask:
+                maskclips = [self.bg.mask] + maskclips
+
+            self.mask = CompositeVideoClip(
+                maskclips,
+                self.size,
+                is_mask=True,
+                bg_color=0.0,
+                memoize_mask=memoize_mask,
+            )
+
+        if self.memoize_mask and self.is_mask:
+            # Memoize the mask to speed up frame generation
+            self.precomputed = {}
+
     def frame_function(self, t):
         """The clips playing at time `t` are blitted over one another."""
+        # For the mask we recalculate the final transparency we'll need
+        # to apply on the result image
         if self.is_mask:
-            bg_t = t - self.bg.start
-            mask_frame = self.bg.get_frame(bg_t)
-            current_mask = mask_frame.copy()
-            for clip in self.playing_clips(t):
-                current_mask = clip.compose_mask(current_mask, t)
-            return current_mask
+            if (
+                self.memoize_mask
+                and t in self.precomputed
+                and self.precomputed[t] is not None
+            ):
+                mask = self.precomputed[t].copy()
+                del self.precomputed[t]  # Free memory as soon as possible
+                return mask
 
+            mask = np.zeros((self.size[1], self.size[0]), dtype=float)
+            for clip in self.playing_clips(t):
+                mask = clip.compose_mask(mask, t)
+
+            return mask
+
+        # Clip merging in pure numpy
         bg_t = t - self.bg.start
         bg_frame = self.bg.get_frame(bg_t).astype("uint8")
-        current_frame = bg_frame.copy()
+        clip_height, clip_width = bg_frame.shape[:2]
+
+        if self.bg.mask:
+            bgm_t = t - self.bg.mask.start
+            bg_mask = self.bg.mask.get_frame(bgm_t)
+
+            # Resize bg_mask to match bg_frame, always use top left corner
+            if bg_frame.shape[:2] != bg_mask.shape[:2]:
+                mask_height, mask_width = bg_mask.shape[:2]
+
+                # If mask is larger, crop it
+                if mask_width > clip_width or mask_height > clip_height:
+                    bg_mask = bg_mask[:clip_height, :clip_width]
+
+                # If mask is smaller, fill it with zeros
+                if mask_width < clip_width or mask_height < clip_height:
+                    new_mask = np.zeros((clip_height, clip_width), dtype=bg_mask.dtype)
+                    new_mask[:mask_height, :mask_width] = bg_mask
+                    bg_mask = new_mask
+
+        # For each clip apply on top of current img
+        current_frame = bg_frame
+        current_mask = bg_mask if self.bg.mask else None
         for clip in self.playing_clips(t):
-            current_frame = clip.compose_on(current_frame, t)
+            current_frame, current_mask = clip.compose_on(
+                current_frame, t, current_mask
+            )
+            if self.mask and self.memoize_mask:
+                self.mask.precomputed[t] = current_mask
 
         return current_frame
 
@@ -241,7 +317,8 @@ def concatenate_videoclips(
       resolution will be such that no clip has to be resized.
       As a consequence the final clip has the height of the highest clip and the
       width of the widest clip of the list. All the clips with smaller dimensions
-      will appear centered. The border uses the color specified by ``bg_color``.
+      will appear centered. The border will be transparent if mask=True, else it
+      will be of the color specified by ``bg_color``.
 
     The clip with the highest FPS will be the FPS of the result clip.
 
@@ -257,7 +334,7 @@ def concatenate_videoclips(
 
     bg_color
       Only for method='compose'. Color of the background.
-      ``None`` falls back to black.
+      Set to None for a transparent clip
 
     padding
       Only for method='compose'. Duration during two consecutive clips.
